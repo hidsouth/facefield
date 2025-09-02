@@ -1,1 +1,157 @@
 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Project 3 — Portrait Flow Field with FaceMesh</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+
+  <!-- p5.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+  <!-- MediaPipe FaceMesh -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/facemesh/facemesh.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/facemesh"></script>
+
+  <style>
+    html, body { margin:0; padding:0; background:#000; height:100%; overflow:hidden; }
+    canvas { display:block; }
+    #captureBtn {
+      position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
+      width: 80px; height: 80px; border-radius: 50%;
+      background: rgba(255,255,255,0.95); border: 6px solid white; z-index:10;
+    }
+    #toggleBtn {
+      position: fixed; bottom: 30px; left: 30px; width: 44px; height: 44px;
+      border-radius: 50%; background: rgba(200,200,200,0.35); border: 2px solid white; z-index:10;
+    }
+    #toggleBtn.colorMode { background: yellow; border: 2px solid black; }
+    #flipBtn {
+      position: fixed; bottom: 30px; right: 30px; width: 44px; height: 44px;
+      border-radius: 50%; background: rgba(200,200,200,0.35); border: 2px solid white; z-index:10;
+    }
+  </style>
+</head>
+<body>
+  <button id="captureBtn"></button>
+  <button id="toggleBtn"></button>
+  <button id="flipBtn"></button>
+
+<script>
+/* === Config === */
+const PREVIEW_COUNT = 400;
+const LINE_LEN_PREVIEW = 100;
+const SCL = 20, STEP_SPEED = 2, NOISE_INC = 0.005;
+const PALETTE = [[0,102,255],[255,30,30],[255,220,0]];
+
+let video, facingMode="user"; // default to selfie
+let bwMode = true;
+let faceModel, predictions = [];
+
+/* === Setup === */
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  pixelDensity(1);
+  frameRate(30);
+
+  startCamera();
+  loadFaceMesh();
+
+  document.getElementById("toggleBtn").onclick = () => {
+    bwMode = !bwMode;
+    const btn=document.getElementById("toggleBtn");
+    if (bwMode) btn.classList.remove("colorMode"); else btn.classList.add("colorMode");
+  };
+  document.getElementById("flipBtn").onclick = () => {
+    facingMode=(facingMode==="environment")?"user":"environment";
+    if (video) video.remove();
+    startCamera();
+  };
+
+  background(0);
+}
+
+function startCamera(){
+  video=createCapture({video:{facingMode:facingMode}, audio:false});
+  video.elt.setAttribute("playsinline","");
+  video.size(width,height);
+  video.hide();
+}
+
+async function loadFaceMesh(){
+  faceModel = await facemesh.load();
+}
+
+/* === Draw Loop === */
+function draw() {
+  background(0);
+
+  if (!video || !faceModel) return;
+
+  // Run facemesh every few frames
+  if (frameCount % 5 === 0) {
+    faceModel.estimateFaces({input: video.elt}).then(res => { predictions = res; });
+  }
+
+  // Flow field grid
+  let cols=int(width/SCL), rows=int(height/SCL);
+  let flowfield=Array.from({length:cols},()=>Array(rows));
+  let yoff=0;
+  for(let y=0;y<rows;y++){
+    let xoff=0;
+    for(let x=0;x<cols;x++){
+      let angle=noise(xoff,yoff,0)*TWO_PI*2;
+      flowfield[x][y]=p5.Vector.fromAngle(angle).setMag(1);
+      xoff+=NOISE_INC;
+    }
+    yoff+=NOISE_INC;
+  }
+
+  // Landmark positions
+  let landmarks=[];
+  if (predictions.length>0){
+    for (let lm of predictions[0].scaledMesh){
+      landmarks.push(createVector(lm[0], lm[1]));
+    }
+  }
+
+  function landmarkAttraction(p){
+    if (landmarks.length===0) return p;
+    let closest=null, dmin=50;
+    for (let lm of landmarks){
+      let d=p.dist(lm);
+      if (d<dmin){ dmin=d; closest=lm; }
+    }
+    if (closest){ 
+      let dir=p5.Vector.sub(closest,p).mult(0.05);
+      return p5.Vector.add(p,dir);
+    }
+    return p;
+  }
+
+  function spawn(){ return createVector(random(width),random(height)); }
+
+  class FlowLine{
+    constructor(){this.pos=spawn();this.col=bwMode?color(255):color(...PALETTE[int(random(PALETTE.length))]);this.sw=(random(1)<0.7)?1:2;this.pts=[];}
+    stepOnce(){if(this.pts.length>=LINE_LEN_PREVIEW)return false;
+      let gx=int(constrain(this.pos.x/SCL,0,cols-1));
+      let gy=int(constrain(this.pos.y/SCL,0,rows-1));
+      let f=flowfield[gx][gy].copy().mult(STEP_SPEED);
+      let next=p5.Vector.add(this.pos,f);
+      next=landmarkAttraction(next); // pull toward landmarks
+      if(next.x<0||next.x>=width||next.y<0||next.y>=height)return false;
+      this.pos=next;
+      this.pts.push(this.pos.copy());
+      return true;
+    }
+    complete(){let guard=0;while(this.pts.length<LINE_LEN_PREVIEW&&guard<LINE_LEN_PREVIEW*2){if(!this.stepOnce())break;guard++;}}
+    drawShape(){if(this.pts.length<2)return;noFill();stroke(this.col);strokeWeight(this.sw);beginShape();for(const p of this.pts)vertex(p.x,p.y);endShape();}
+  }
+
+  for(let i=0;i<PREVIEW_COUNT;i++){let L=new FlowLine();L.complete();L.drawShape();}
+}
+</script>
+</body>
+</html>
